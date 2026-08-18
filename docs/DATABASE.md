@@ -78,6 +78,12 @@ CREATE TABLE room_types (
 CREATE INDEX idx_room_types_hotel ON room_types(hotel_id);
 CREATE INDEX idx_room_types_active ON room_types(hotel_id, is_active);
 
+-- rooms.status represents OPERATIONAL / HOUSEKEEPING state only.
+-- Occupancy is NOT persisted here; it is derived from reservations
+-- (room_id + active reservation status + check_in/check_out dates).
+-- A room can be operationally 'available' yet still unavailable for a
+-- specific date range because an active reservation exists.
+-- Availability is computed by the booking engine from reservations.
 CREATE TABLE rooms (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
@@ -85,7 +91,7 @@ CREATE TABLE rooms (
     room_number TEXT NOT NULL,
     floor INT,
     status TEXT NOT NULL DEFAULT 'available'
-        CHECK (status IN ('available','occupied','maintenance','cleaning')),
+        CHECK (status IN ('available','maintenance','cleaning')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (hotel_id, room_number)
