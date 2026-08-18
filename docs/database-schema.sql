@@ -218,7 +218,11 @@ CREATE TABLE reservations (
     check_out_date DATE NOT NULL,
     guests_count INT NOT NULL DEFAULT 1 CHECK (guests_count > 0),
 
-    -- Transaction price snapshot
+    -- Transaction price snapshot.
+    -- These values are the FINAL historical snapshot captured at
+    -- reservation creation. They are NOT derived from or linked to
+    -- the current room_type_rates. Future rate changes must never
+    -- alter historical reservation totals (DB-009).
     subtotal NUMERIC(12,2) NOT NULL CHECK (subtotal >= 0),
     discount_amount NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
     tax_amount NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (tax_amount >= 0),
@@ -274,7 +278,12 @@ WHERE (
 
 -- =========================================================
 -- 6. RESERVATION PRICE ITEMS
--- Optional detailed pricing snapshot for audit/reporting.
+-- Detailed price breakdown, stored as an immutable historical
+-- snapshot at reservation creation (DB-009).
+-- Items are NOT linked to room_type_rates; they preserve the
+-- exact description, quantity, unit amount, and total amount
+-- used when the reservation was created. Later rate changes or
+-- rate deletions must not affect these historical records.
 -- =========================================================
 
 CREATE TABLE reservation_price_items (
