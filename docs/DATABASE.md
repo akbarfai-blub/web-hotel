@@ -37,7 +37,8 @@ CREATE TABLE hotels (
 -- 2. USERS / APPLICATION PROFILE
 -- Supabase Auth owns credentials.
 -- Do NOT store password_hash here.
--- Ideally users.id is linked to auth.users.id.
+-- users.id is linked to auth.users.id via the profile trigger
+-- below (DB-008).
 -- =========================================================
 
 CREATE TYPE user_role AS ENUM ('guest', 'staff', 'admin');
@@ -55,6 +56,64 @@ CREATE TABLE users (
 
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_role ON users(role);
+
+-- =========================================================
+-- 2A. SUPABASE AUTH → PUBLIC.USERS PROFILE TRIGGER
+-- =========================================================
+-- Creates a public.users profile row whenever a new auth.users
+-- row is created. public.users.id = auth.users.id.
+--
+-- Role security:
+--   role always defaults to 'guest'; it is NEVER read from
+--   signup metadata / user metadata / request fields, so a
+--   signup cannot self-assign 'staff' or 'admin'. Role changes
+--   are administrative and performed server-side afterwards.
+--
+-- Credential security:
+--   Only profile fields are copied (id, email, full_name).
+--   No password, password hash, tokens, or secrets are stored.
+--
+-- SECURITY DEFINER is required because public.users has RLS
+-- enabled (DB-007) and no INSERT policy: the function runs as
+-- its owner (table owner) and can therefore insert the profile
+-- row. search_path is pinned to 'public'. The function is
+-- trigger-only; EXECUTE is revoked from PUBLIC so it cannot be
+-- called as a client-facing API.
+--
+-- Email is copied at creation. Synchronizing auth.users.email
+-- → public.users.email on UPDATE is intentionally deferred.
+-- Phone-only signups (auth.users.email = NULL) will fail closed
+-- because public.users.email is NOT NULL.
+-- =========================================================
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    INSERT INTO public.users (id, email, full_name)
+    VALUES (
+        NEW.id,
+        NEW.email,
+        COALESCE(
+            NULLIF(NEW.raw_user_meta_data ->> 'full_name', ''),
+            NULLIF(NEW.raw_user_meta_data ->> 'name', ''),
+            'Guest'
+        )
+    )
+    ON CONFLICT (id) DO NOTHING;
+    RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.handle_new_user() FROM PUBLIC;
+
+CREATE TRIGGER trg_handle_new_user
+AFTER INSERT ON auth.users
+FOR EACH ROW
+EXECUTE FUNCTION public.handle_new_user();
 
 -- =========================================================
 -- 3. ROOM TYPES & ROOMS
@@ -423,11 +482,13 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 -- 13. ROW LEVEL SECURITY
 -- =========================================================
 --
--- Important:
--- The exact role-claim implementation depends on Supabase Auth setup.
+-- The application role source of truth is public.users.role.
+-- Roles are resolved through:
+--   auth.uid() -> public.users.id -> public.users.role
+-- No custom JWT claims are used and no Auth Hook is required.
+-- RLS is defense-in-depth; server-side authorization in the
+-- Next.js application remains the primary authorization layer.
 -- Do not assume a client-provided role is trustworthy.
--- The policies below are a baseline and should be adapted to the
--- final JWT/custom-claims configuration.
 -- =========================================================
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
@@ -443,6 +504,15 @@ ALTER TABLE chatbot_conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE chatbot_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
+-- Guest can read own profile.
+-- Required so role resolution via public.users works: without it the
+-- role-lookup subqueries below see no rows (RLS default-deny) and
+-- staff/admin policies would never match.
+CREATE POLICY guest_own_profile_select
+ON users
+FOR SELECT
+USING (id = auth.uid());
+
 -- Guest can read own reservations.
 CREATE POLICY guest_own_reservations_select
 ON reservations
@@ -450,11 +520,17 @@ FOR SELECT
 USING (guest_id = auth.uid());
 
 -- Staff/admin can read all reservations.
+-- Role is resolved from public.users.role, not from a JWT claim.
 CREATE POLICY staff_admin_reservations_select
 ON reservations
 FOR SELECT
 USING (
-    (auth.jwt() ->> 'role') IN ('staff', 'admin')
+    EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = auth.uid()
+          AND u.role IN ('staff', 'admin')
+    )
 );
 
 -- Guest can read own payments through reservation ownership.
@@ -475,7 +551,12 @@ CREATE POLICY staff_admin_payments_select
 ON payments
 FOR SELECT
 USING (
-    (auth.jwt() ->> 'role') IN ('staff', 'admin')
+    EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = auth.uid()
+          AND u.role IN ('staff', 'admin')
+    )
 );
 
 -- Guest can read own reviews.
@@ -503,7 +584,12 @@ CREATE POLICY staff_admin_kb_select
 ON chatbot_knowledge_base
 FOR SELECT
 USING (
-    (auth.jwt() ->> 'role') IN ('staff', 'admin')
+    EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = auth.uid()
+          AND u.role IN ('staff', 'admin')
+    )
 );
 
 -- Users can read their own chatbot conversations.
@@ -530,7 +616,12 @@ CREATE POLICY staff_admin_audit_select
 ON audit_logs
 FOR SELECT
 USING (
-    (auth.jwt() ->> 'role') IN ('staff', 'admin')
+    EXISTS (
+        SELECT 1
+        FROM users u
+        WHERE u.id = auth.uid()
+          AND u.role IN ('staff', 'admin')
+    )
 );
 
 -- =========================================================
