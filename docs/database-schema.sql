@@ -260,6 +260,14 @@ CREATE INDEX idx_reservations_guest
 CREATE INDEX idx_reservations_hotel_status
     ON reservations(hotel_id, status);
 
+-- Staff dashboard: today's arrivals.
+CREATE INDEX idx_reservations_hotel_check_in
+    ON reservations(hotel_id, check_in_date);
+
+-- Staff dashboard: today's departures.
+CREATE INDEX idx_reservations_hotel_check_out
+    ON reservations(hotel_id, check_out_date);
+
 CREATE INDEX idx_reservations_payment_expiry
     ON reservations(payment_expires_at)
     WHERE status = 'pending_payment';
