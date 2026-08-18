@@ -241,6 +241,7 @@ CREATE TABLE reservations (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CHECK (check_out_date > check_in_date),
+    CHECK (discount_amount <= subtotal),
     CHECK (
         total_price =
         subtotal
@@ -293,9 +294,10 @@ CREATE TABLE reservation_price_items (
         CHECK (item_type IN ('room_charge', 'tax', 'service_fee', 'discount', 'other')),
     description TEXT NOT NULL,
     quantity NUMERIC(12,2) NOT NULL DEFAULT 1 CHECK (quantity > 0),
-    unit_amount NUMERIC(12,2) NOT NULL,
-    total_amount NUMERIC(12,2) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    unit_amount NUMERIC(12,2) NOT NULL CHECK (unit_amount >= 0),
+    total_amount NUMERIC(12,2) NOT NULL CHECK (total_amount >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (total_amount = quantity * unit_amount)
 );
 
 CREATE INDEX idx_price_items_reservation
@@ -322,7 +324,7 @@ CREATE TABLE payments (
     provider_order_id TEXT,
     provider_transaction_id TEXT UNIQUE,
 
-    amount NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+    amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
     currency TEXT NOT NULL DEFAULT 'IDR',
 
     method TEXT,
