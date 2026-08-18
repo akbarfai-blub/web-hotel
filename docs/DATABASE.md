@@ -348,6 +348,19 @@ CREATE INDEX idx_payments_reservation
 CREATE INDEX idx_payments_provider_order
     ON payments(provider_order_id);
 
+-- A reservation may have multiple payment attempts (expired, failed,
+-- retried, pending). Multiple attempts for the same reservation are
+-- intentionally allowed and can coexist.
+-- However, a reservation must never have more than one payment with
+-- status = 'paid'. The partial unique index enforces exactly one paid
+-- payment per reservation and is the final database-level protection
+-- against two concurrent successful payment writes (DB-011).
+-- A refunded payment uses the same row (status 'paid' -> 'refunded')
+-- and is a historical record; it is not a second paid payment.
+CREATE UNIQUE INDEX uq_payments_one_paid
+    ON payments(reservation_id)
+    WHERE status = 'paid';
+
 -- =========================================================
 -- 8. REVIEWS
 -- =========================================================
