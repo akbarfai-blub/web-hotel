@@ -103,9 +103,11 @@ CREATE INDEX idx_rooms_hotel_status ON rooms(hotel_id, status);
 -- =========================================================
 -- 4. ROOM TYPE RATES
 -- Seasonal/dynamic pricing.
--- Date range is inclusive.
--- Application layer should prevent conflicting rate rules
--- for the same room type/date range.
+-- Date range uses half-open [start_date, end_date) semantics,
+-- so same-day rate boundaries are allowed:
+--   [2026-08-01, 2026-08-15) and [2026-08-15, 2026-08-31) are valid.
+-- Overlapping rate periods for the same room type are rejected by
+-- the no_overlapping_rates exclusion constraint (DB-006).
 -- =========================================================
 
 CREATE TABLE room_type_rates (
@@ -116,11 +118,21 @@ CREATE TABLE room_type_rates (
     price_override NUMERIC(12,2) NOT NULL CHECK (price_override >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (end_date >= start_date)
+    CHECK (end_date > start_date)
 );
 
 CREATE INDEX idx_rates_room_type_dates
     ON room_type_rates(room_type_id, start_date, end_date);
+
+-- Prevent conflicting rate periods for the same room type.
+-- Uses [start_date, end_date) half-open ranges, so same-day
+-- boundaries do not overlap. Requires btree_gist for equality.
+ALTER TABLE room_type_rates
+ADD CONSTRAINT no_overlapping_rates
+EXCLUDE USING gist (
+    room_type_id WITH =,
+    daterange(start_date, end_date, '[)') WITH &&
+);
 
 -- =========================================================
 -- 5. RESERVATIONS
