@@ -1,7 +1,16 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// =========================================================
+// Web Hotel — Prisma schema (ORM view)
+//
+// Source of truth: docs/database-schema.sql
+// Prisma is the ORM representation only.
+// PostgreSQL remains the source of truth for database integrity:
+//   - EXCLUDE USING GIST constraints (no_overlapping_bookings,
+//     no_overlapping_rates) — SQL migration / manual SQL
+//   - partial indexes (reservation payment expiry, uq_payments_one_paid)
+//     — SQL migration / manual SQL
+//   - RLS policies, auth trigger, SECURITY DEFINER functions,
+//     updated_at triggers, extensions, pgvector index — SQL-managed
+// =========================================================
 
 generator client {
   provider = "prisma-client"
@@ -10,4 +19,367 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// =========================================================
+// ENUMS
+// =========================================================
+
+enum UserRole {
+  guest
+  staff
+  admin
+
+  @@map("user_role")
+}
+
+enum ReservationStatus {
+  pending_payment
+  confirmed
+  checked_in
+  checked_out
+  cancelled
+  no_show
+  expired
+
+  @@map("reservation_status")
+}
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+  expired
+  refunded
+
+  @@map("payment_status")
+}
+
+// =========================================================
+// HOTEL
+// =========================================================
+
+model Hotel {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String
+  address      String?
+  city         String?
+  checkInTime  DateTime @default(dbgenerated("'14:00'::time")) @db.Time @map("check_in_time")
+  checkOutTime DateTime @default(dbgenerated("'12:00'::time")) @db.Time @map("check_out_time")
+  createdAt    DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt    DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  roomTypes             RoomType[]
+  rooms                 Room[]
+  reservations          Reservation[]
+  chatbotKnowledgeBases ChatbotKnowledgeBase[]
+  chatbotConversations  ChatbotConversation[]
+
+  @@map("hotels")
+}
+
+// =========================================================
+// USERS / APPLICATION PROFILE
+// Supabase Auth owns credentials. users.id = auth.users.id,
+// supplied by the handle_new_user() trigger (DB-008).
+// Intentionally NO generated default on id.
+// =========================================================
+
+model User {
+  id                      String  @id @db.Uuid
+  email                   String  @unique(map: "users_email_key")
+  phone                   String?
+  fullName                String  @map("full_name")
+  role                    UserRole @default(guest)
+  identityNumberEncrypted String? @map("identity_number_encrypted")
+  createdAt               DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt               DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  reservations         Reservation[]         @relation("ReservationGuest")
+  reviews              Review[]              @relation("ReviewGuest")
+  chatbotConversations ChatbotConversation[] @relation("ConversationUser")
+  auditLogs            AuditLog[]            @relation("AuditLogActor")
+
+  @@index([email], map: "idx_users_email")
+  @@index([role], map: "idx_users_role")
+  @@map("users")
+}
+
+// =========================================================
+// ROOM TYPES & ROOMS
+// =========================================================
+
+model RoomType {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  hotelId      String   @map("hotel_id") @db.Uuid
+  name         String
+  description  String?
+  basePrice    Decimal  @map("base_price") @db.Decimal(12, 2)
+  maxOccupancy Int      @default(2) @map("max_occupancy")
+  sizeSqm      Decimal? @map("size_sqm") @db.Decimal(6, 2)
+  amenities    Json     @default("[]")
+  images       Json     @default("[]")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt    DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  hotel        Hotel            @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  rooms        Room[]
+  roomTypeRates RoomTypeRate[]
+  reservations Reservation[]
+
+  @@index([hotelId], map: "idx_room_types_hotel")
+  @@index([hotelId, isActive], map: "idx_room_types_active")
+  @@map("room_types")
+}
+
+model Room {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  hotelId    String   @map("hotel_id") @db.Uuid
+  roomTypeId String   @map("room_type_id") @db.Uuid
+  roomNumber String   @map("room_number")
+  floor      Int?
+  // Operational/housekeeping state only (TEXT + DB CHECK constraint).
+  // Approved values: available | cleaning | maintenance.
+  // Occupancy is derived from reservations; never persisted here (DB-005).
+  status     String   @default("available")
+  createdAt  DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt  DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  hotel        Hotel         @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  roomType     RoomType      @relation(fields: [roomTypeId], references: [id], onDelete: Restrict)
+  reservations Reservation[]
+
+  @@unique([hotelId, roomNumber], map: "rooms_hotel_id_room_number_key")
+  @@index([roomTypeId], map: "idx_rooms_type")
+  @@index([hotelId, status], map: "idx_rooms_hotel_status")
+  @@map("rooms")
+}
+
+// =========================================================
+// ROOM TYPE RATES
+// Seasonal/dynamic pricing. Half-open [start_date, end_date) ranges;
+// overlap protection via no_overlapping_rates EXCLUDE USING GIST
+// constraint remains PostgreSQL-managed (DB-006).
+// room_type_rates → room_types ON DELETE CASCADE is the current
+// database behavior (deferred architectural decision).
+// =========================================================
+
+model RoomTypeRate {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  roomTypeId    String   @map("room_type_id") @db.Uuid
+  startDate     DateTime @db.Date @map("start_date")
+  endDate       DateTime @db.Date @map("end_date")
+  priceOverride Decimal  @map("price_override") @db.Decimal(12, 2)
+  createdAt     DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt     DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  roomType RoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+
+  @@index([roomTypeId, startDate, endDate], map: "idx_rates_room_type_dates")
+  @@map("room_type_rates")
+}
+
+// =========================================================
+// RESERVATIONS
+// Price columns are an immutable historical transaction snapshot
+// (DB-009). Overlap protection via no_overlapping_bookings
+// EXCLUDE USING GIST remains PostgreSQL-managed (DB-001/DB-002).
+// reservations → hotels ON DELETE CASCADE is current database
+// behavior (deferred architectural decision).
+// The partial index idx_reservations_payment_expiry
+// (WHERE status = 'pending_payment') remains SQL-managed.
+// =========================================================
+
+model Reservation {
+  id               String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  hotelId          String            @map("hotel_id") @db.Uuid
+  guestId          String            @map("guest_id") @db.Uuid
+  roomId           String            @map("room_id") @db.Uuid
+  roomTypeId       String            @map("room_type_id") @db.Uuid
+  checkInDate      DateTime          @db.Date @map("check_in_date")
+  checkOutDate     DateTime          @db.Date @map("check_out_date")
+  guestsCount      Int               @default(1) @map("guests_count")
+  subtotal         Decimal           @db.Decimal(12, 2)
+  discountAmount   Decimal           @default(0) @map("discount_amount") @db.Decimal(12, 2)
+  taxAmount        Decimal           @default(0) @map("tax_amount") @db.Decimal(12, 2)
+  serviceFee       Decimal           @default(0) @map("service_fee") @db.Decimal(12, 2)
+  totalPrice       Decimal           @map("total_price") @db.Decimal(12, 2)
+  currency         String            @default("IDR")
+  status           ReservationStatus @default(pending_payment)
+  specialRequests  String?           @map("special_requests")
+  paymentExpiresAt DateTime?         @db.Timestamptz @map("payment_expires_at")
+  createdAt        DateTime          @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt        DateTime          @default(now()) @db.Timestamptz @map("updated_at")
+
+  hotel       Hotel                  @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  guest       User                   @relation("ReservationGuest", fields: [guestId], references: [id], onDelete: Restrict)
+  room        Room                   @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  roomType    RoomType               @relation(fields: [roomTypeId], references: [id], onDelete: Restrict)
+  priceItems  ReservationPriceItem[]
+  payments    Payment[]
+  review      Review?
+
+  @@index([roomId, checkInDate, checkOutDate], map: "idx_reservations_room_dates")
+  @@index([guestId], map: "idx_reservations_guest")
+  @@index([hotelId, status], map: "idx_reservations_hotel_status")
+  @@index([hotelId, checkInDate], map: "idx_reservations_hotel_check_in")
+  @@index([hotelId, checkOutDate], map: "idx_reservations_hotel_check_out")
+  @@map("reservations")
+}
+
+// =========================================================
+// RESERVATION PRICE ITEMS
+// Immutable historical price breakdown snapshot (DB-009).
+// Dependent data: cascades with its reservation (approved DB-013).
+// =========================================================
+
+model ReservationPriceItem {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reservationId String   @map("reservation_id") @db.Uuid
+  itemType      String   @map("item_type")
+  description   String
+  quantity      Decimal  @default(1) @db.Decimal(12, 2)
+  unitAmount    Decimal  @map("unit_amount") @db.Decimal(12, 2)
+  totalAmount   Decimal  @map("total_amount") @db.Decimal(12, 2)
+  createdAt     DateTime @default(now()) @db.Timestamptz @map("created_at")
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@index([reservationId], map: "idx_price_items_reservation")
+  @@map("reservation_price_items")
+}
+
+// =========================================================
+// PAYMENTS
+// Multiple attempts per reservation allowed (DB-011).
+// reservation_id is intentionally NOT unique in Prisma:
+// uniqueness is enforced by the partial unique index
+// uq_payments_one_paid WHERE status = 'paid' (SQL-managed).
+// Financial history protected with RESTRICT (DB-013).
+// =========================================================
+
+model Payment {
+  id                    String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reservationId         String        @map("reservation_id") @db.Uuid
+  provider              String        @default("midtrans")
+  providerOrderId       String?       @map("provider_order_id")
+  providerTransactionId String?       @unique(map: "payments_provider_transaction_id_key") @map("provider_transaction_id")
+  amount                Decimal       @db.Decimal(12, 2)
+  currency              String        @default("IDR")
+  method                String?
+  transactionStatus     String?       @map("transaction_status")
+  fraudStatus           String?       @map("fraud_status")
+  status                PaymentStatus @default(pending)
+  paidAt                DateTime?     @db.Timestamptz @map("paid_at")
+  providerResponse      Json?         @map("provider_response")
+  createdAt             DateTime      @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt             DateTime      @default(now()) @db.Timestamptz @map("updated_at")
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+
+  @@index([reservationId], map: "idx_payments_reservation")
+  @@index([providerOrderId], map: "idx_payments_provider_order")
+  @@map("payments")
+}
+
+// =========================================================
+// REVIEWS
+// Review history protected with RESTRICT on both FKs (DB-013).
+// One review per reservation via uq_reviews_reservation.
+// =========================================================
+
+model Review {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  reservationId String   @unique(map: "uq_reviews_reservation") @map("reservation_id") @db.Uuid
+  guestId       String   @map("guest_id") @db.Uuid
+  rating        Int
+  comment       String?
+  createdAt     DateTime @default(now()) @db.Timestamptz @map("created_at")
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+  guest       User        @relation("ReviewGuest", fields: [guestId], references: [id], onDelete: Restrict)
+
+  @@index([guestId], map: "idx_reviews_guest")
+  @@map("reviews")
+}
+
+// =========================================================
+// CHATBOT KNOWLEDGE BASE
+// embedding is pgvector VECTOR(1536), nullable.
+// Represented as Unsupported so the column is preserved exactly;
+// vector access and the ivfflat index remain SQL-managed.
+// =========================================================
+
+model ChatbotKnowledgeBase {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  hotelId   String   @map("hotel_id") @db.Uuid
+  title     String
+  category  String
+  content   String
+  sourceUrl String?  @map("source_url")
+  embedding Unsupported("vector(1536)")?
+  createdAt DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt DateTime @default(now()) @db.Timestamptz @map("updated_at")
+
+  hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
+  @@index([hotelId, category], map: "idx_kb_hotel_category")
+  @@map("chatbot_knowledge_base")
+}
+
+// =========================================================
+// CHATBOT CONVERSATIONS & MESSAGES
+// user_id / hotel_id are nullable with SET NULL semantics.
+// Messages are dependent data: cascade with their conversation.
+// =========================================================
+
+model ChatbotConversation {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String?   @map("user_id") @db.Uuid
+  hotelId   String?   @map("hotel_id") @db.Uuid
+  startedAt DateTime  @default(now()) @db.Timestamptz @map("started_at")
+  endedAt   DateTime? @db.Timestamptz @map("ended_at")
+
+  user     User?            @relation("ConversationUser", fields: [userId], references: [id], onDelete: SetNull)
+  hotel    Hotel?           @relation(fields: [hotelId], references: [id], onDelete: SetNull)
+  messages ChatbotMessage[]
+
+  @@index([userId], map: "idx_chatbot_conversations_user")
+  @@map("chatbot_conversations")
+}
+
+model ChatbotMessage {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  sender         String
+  content        String
+  createdAt      DateTime @default(now()) @db.Timestamptz @map("created_at")
+
+  conversation ChatbotConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt], map: "idx_chatbot_messages_conv")
+  @@map("chatbot_messages")
+}
+
+// =========================================================
+// AUDIT LOG
+// Historical record. actor_id is nullable with SET NULL so logs
+// survive deletion of the acting user.
+// =========================================================
+
+model AuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id") @db.Uuid
+  metadata   Json?
+  createdAt  DateTime @default(now()) @db.Timestamptz @map("created_at")
+
+  actor User? @relation("AuditLogActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId], map: "idx_audit_entity")
+  @@index([actorId, createdAt], map: "idx_audit_actor")
+  @@map("audit_logs")
 }
