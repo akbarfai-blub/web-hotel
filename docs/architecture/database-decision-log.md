@@ -36,7 +36,7 @@ while PostgreSQL-specific features remain in SQL migrations where necessary.
 | DB-010 | Payment Integrity   | Add payment/check constraints                  | SHOULD FIX   | Approved |
 | DB-011 | Payment Attempts    | Allow multiple attempts, only one paid payment | SHOULD FIX   | Approved |
 | DB-012 | Staff Queries       | Add arrival/departure indexes                  | SHOULD FIX   | Approved |
-| DB-013 | FK Delete Rules     | Preserve payment/review history                | SHOULD FIX   | Approved |
+| DB-013 | FK Delete Rules     | RESTRICT payments/reviews history              | SHOULD FIX   | Approved |
 | DB-014 | Payment Timestamps  | Consider expired_at / failed_at                | DEFERRED     | Deferred |
 | DB-015 | Vector Index        | Prefer HNSW for small KB                       | OPTIMIZATION | Deferred |
 | DB-016 | Room Maintenance    | Global maintenance for v1                      | DEFERRED     | Deferred |
@@ -285,13 +285,51 @@ Use a PostgreSQL partial unique index for paid payments.
 
 ## DB-013 — Preserve Financial & Review History
 
-Payments and reviews must not be silently deleted when a reservation
-is deleted.
+Decision: APPLY restrictive delete semantics to financial and
+review history.
 
-Prefer restrictive delete semantics.
+Approved FK changes:
+
+| Child                       | FK Column       | Parent          | Old        | New        |
+| --------------------------- | --------------- | --------------- | ---------- | ---------- |
+| payments                    | reservation_id  | reservations.id | CASCADE    | RESTRICT   |
+| reviews                     | reservation_id  | reservations.id | CASCADE    | RESTRICT   |
+| reviews                     | guest_id        | users.id        | CASCADE    | RESTRICT   |
+
+Reasons:
+
+- Payments are historical/financial records and must not be
+  silently deleted when a reservation is deleted.
+- Review history must not be silently deleted when a reservation
+  is deleted.
+- Guest review history must not be silently deleted when a user
+  is deleted. Users with historical business records are handled
+  through anonymization rather than hard deletion.
+
+Unchanged (dependent data, CASCADE retained):
+
+- `reservation_price_items.reservation_id → reservations.id`
+  (price items are an immutable breakdown owned by the reservation)
+- `chatbot_messages.conversation_id → chatbot_conversations.id`
+  (messages have no independent meaning without their conversation)
+
+Deferred — requires future architectural decision:
+
+- `reservations.hotel_id → hotels.id`
+  Current behavior: ON DELETE CASCADE.
+  Deletion semantics for hotels with historical reservations are
+  not defined by the current source documents. Left unchanged
+  pending an explicit decision.
+- `room_type_rates.room_type_id → room_types.id`
+  Current behavior: ON DELETE CASCADE.
+  Rate history preservation on room type deletion is not decided
+  by the current source documents. Left unchanged pending an
+  explicit decision.
 
 Guest PII deletion should use anonymization rather than deleting
 historical reservation records.
+
+All other existing FK delete rules remain unchanged.
 
 ---
 

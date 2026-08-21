@@ -326,7 +326,9 @@ CREATE TYPE payment_status AS ENUM (
 
 CREATE TABLE payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reservation_id UUID NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    -- DB-013: payments are historical financial records.
+    -- Deleting a reservation must not silently delete its payment history.
+    reservation_id UUID NOT NULL REFERENCES reservations(id) ON DELETE RESTRICT,
 
     provider TEXT NOT NULL DEFAULT 'midtrans',
     provider_order_id TEXT,
@@ -375,8 +377,11 @@ CREATE UNIQUE INDEX uq_payments_one_paid
 
 CREATE TABLE reviews (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reservation_id UUID NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
-    guest_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- DB-013: review history must not be silently deleted when a
+    -- reservation or user is deleted. Users with historical business
+    -- records are anonymized rather than hard-deleted.
+    reservation_id UUID NOT NULL REFERENCES reservations(id) ON DELETE RESTRICT,
+    guest_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
     comment TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
